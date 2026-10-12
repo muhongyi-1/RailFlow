@@ -2,7 +2,7 @@ name: Publish RailFlow source
 on:
   push:
     paths:
-      - release/railflow.tar.xz
+      - 'release/**'
   workflow_dispatch:
 permissions:
   contents: write
@@ -29,7 +29,9 @@ jobs:
                   with pack.extractfile(item) as source:
                       path.write_bytes(source.read())
           archive.unlink()
+          Path('release/retry-trigger.txt').unlink(missing_ok=True)
           archive.parent.rmdir()
+          Path('.github/workflows/tests.yml').unlink(missing_ok=True)
           print(f"Extracted {len(members)} project files")
           PY
       - name: Commit and push source tree

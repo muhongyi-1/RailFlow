@@ -1,0 +1,1 @@
+retry source publication without writing workflows from automation token
