@@ -1,0 +1,25 @@
+# RailFlow Day7 RabbitMQ 配置
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: railflow-rabbitmq
+    restart: unless-stopped
+
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-railflow}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+
+    ports:
+      # 消息队列端口
+      - "5672:5672"
+
+      # Web管理后台端口
+      - "15672:15672"
+
+    volumes:
+      # 持久化RabbitMQ数据
+      - railflow_rabbitmq_data:/var/lib/rabbitmq
+
+volumes:
+  railflow_rabbitmq_data:
