@@ -1,120 +1,93 @@
-# RailFlow — 区间库存与异步支付票务系统
+# RailFlow — Java 区间库存与异步支付票务系统
 
-基于 **Python 3.12 / FastAPI / SQLAlchemy / MySQL / Redis / RabbitMQ** 的学习型后端项目。支持车次查询、座位区间 Bitmap 库存、订单幂等、模拟支付回调、RabbitMQ 异步消费、超时关单，以及库存对账与安全补偿工具。
+Java 17 / Spring Boot 3.5 / Spring JDBC / MySQL / Redis / RabbitMQ。应用、消费者、调度器、运维脚本及测试均迁移为 Java，无需 Python 环境。支付仍是模拟 HMAC 通知。
 
-> 项目用于工程实践与面试展示。支付使用本地模拟平台，不涉及真实资金；不能把死信分类视为自动退款。请勿在生产环境使用示例密码。
+## 构建与启动
 
-## 核心流程
-
-```text
-GET /api/v1/trains/search  → 途经站与日期查询
-GET /api/v1/seats/available → Bitmap 区间空闲判断
-POST /api/v1/orders         → 幂等键 + Redis 座位锁 + MySQL 行锁
-                            → 同一事务创建 PENDING_PAYMENT 订单和占座
-POST /api/v1/payment/callback → HMAC-SHA256 验签 → RabbitMQ
-独立 payment_consumer       → 订单行锁 + 超时/状态校验 → PAID / DLQ
-独立 run_order_scheduler    → 扫描过期订单 → CLOSED + 安全释放 Bitmap
-```
-
-**库存一致性基准**：对同一座位，当前 Bitmap 应当等于所有未关闭待支付订单及已支付订单的掩码按位或。发生历史脏数据时，不能直接清零 Bitmap。
-
-## 目录说明
-
-```text
-app/
-  api/              车次、可售座位、订单、模拟支付回调
-  core/             .env 设置、Redis、RabbitMQ
-  db/               Session、建表、演示车次数据
-  models/           Station、Train、TrainStop、TrainSeat、Order
-  repositories/     查询数据库的仓储封装
-  schemas/          请求与响应 Pydantic 模型
-  services/         车次与订单业务、支付状态机
-  tasks/            过期关单任务与调度器
-  workers/          RabbitMQ 支付消费者
-scripts/             初始化、对账、补偿预览、压测与演练脚本
-tests/               SQLite/内存自动化测试
-sql/                 库存对账 SQL
-.github/workflows/    CI 自动测试
-```
-
-## 本机启动（Windows PowerShell）
-
-1. **准备配置**。复制示例文件并设置自己本机的值（已有 RailFlow `.env` 时，不要覆盖，需补充 `RABBITMQ_PASSWORD`）：
-
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-
-   把 `CHANGE_ME` 全部替换成真实本机开发值。`DATABASE_URL` 是从 Windows 访问 MySQL 的 `127.0.0.1:3307`。如密码带特殊字符，URL 中必须做 URL 编码。FastAPI、支付模拟脚本共用 `RAILFLOW_PAYMENT_CALLBACK_SECRET`；API 与消费者共用 RabbitMQ 配置。
-
-2. **安装依赖并启动基础设施**：
-
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   python -m pip install -r requirements.txt
-   docker compose -f docker-compose.yml up -d
-   docker compose -f docker-compose.rabbitmq.yml up -d
-   docker run -d --name railflow-redis -p 127.0.0.1:6379:6379 redis:7.4-alpine
-   ```
-
-   **已有同名 Docker 容器正在运行时不要重复创建**，尤其不要删除数据库卷。RabbitMQ 后台：http://127.0.0.1:15672。
-
-3. **新环境首次初始化**（不会清除旧订单或 Bitmap）：
-
-   ```powershell
-   python -m scripts.create_tables
-   python -m scripts.init_data
-   ```
-
-4. **分别开启三个终端**，使用相同项目环境：
-
-   ```powershell
-   python -m uvicorn app.main:app --host 127.0.0.1 --port 8011
-   python -m app.workers.payment_consumer
-   python -m scripts.run_order_scheduler
-   ```
-
-   `/docs`：http://127.0.0.1:8011/docs；`/health`：http://127.0.0.1:8011/health。**同一环境只运行一个订单调度器。**
-
-## 自动化测试
+准备 JDK 17+、Maven 3.6.3+，JAVA_HOME 指向 JDK。
 
 ```powershell
-python -m pytest -q
+mvn -B verify
+Copy-Item .env.example .env
 ```
 
-原版项目在本机运行 **40 passed**；清理版保留原有 40 个测试，并配置 GitHub Actions 在 SQLite/内存环境执行单元测试。完整的 MySQL / Redis / RabbitMQ 端到端验证需要另外启动容器。
+把所有 CHANGE_ME 替换为开发配置。已有 .env 请手动迁移，不要覆盖。DATABASE_URL 改成 JDBC URL，用户名和密码分别使用 MYSQL_USER、MYSQL_PASSWORD。应用读取当前目录 .env（Java properties 格式，值无需引号，反斜杠需转义），也支持环境变量。
 
-## 功能脚本与命名
+```powershell
+docker compose up -d
+docker compose -f docker-compose.rabbitmq.yml up -d
+java -jar target/railflow-2.0.0.jar --railflow.command=create-tables
+java -jar target/railflow-2.0.0.jar --railflow.command=init-data
+```
 
-| 命令 | 作用 | 数据影响 |
-|---|---|---|
-| `python -m scripts.booking_load_test --train-id 1 --seat-id 3 --start 0 --end 2 --count 20 --workers 10 --mode different` | 并发抢票实验 | **真实创建订单**，只能使用空闲测试区间 |
-| `python -m scripts.inventory_audit` | 全座位订单/Bitmap 对账 | 只读 |
-| `python -m scripts.inventory_repair --demo` | 模拟五种异常 | 纯内存 |
-| `python -m scripts.inventory_repair --seat-id 4` | 补偿前安全预览 | 只读 |
-| `python -m scripts.payment_close_race` | 支付与关单竞争演练 | 纯内存 |
-| `python -m scripts.dead_letter_audit --order-no <订单号> --payment-no <流水号> --event-timestamp <UNIX秒>` | 死信关联订单对账 | 只读 |
-| `python -m scripts.simulate_payment_callback <订单号> --payment-no pay_test_001` | 模拟支付通知 | 发布真实 MQ 消息 |
+已有同名容器时复用现有服务及数据卷。建表和演示数据初始化不清空已有订单或 Bitmap。演示车次为当日 G1001。
 
-对账补偿的 `--apply` 属于高风险维护操作：需停掉全部写入服务、备份数据，并在确认订单合法且无重叠后执行；**严禁随意清空所有座位 Bitmap**。
+三个终端分别启动 API、支付消费者、关单调度器：
 
-## 并发与一致性设计
+```powershell
+java -jar target/railflow-2.0.0.jar
+java -jar target/railflow-2.0.0.jar --railflow.command=payment-consumer
+java -jar target/railflow-2.0.0.jar --railflow.command=order-scheduler
+```
 
-- **Bitmap**：用每一位表示一段相邻站点区间，同一座位允许出售不重叠的乘车区间。
-- **防超卖**：Redis 座位锁减少竞争；MySQL `SELECT FOR UPDATE` 行锁和事务保障座位占用与订单创建的一致性。这里不是 Redis Lua 原子预占。
-- **下单幂等**：按 `(user_id, request_id)` 联合唯一约束兜底，Redis 缓存仅作加速。
-- **支付幂等**：支付成功/重复投递分别返回 `PAID` / `ALREADY_PAID`；不代表真实资金交易流水去重。
-- **超时关单**：独立任务锁订单与座位，发现 Bitmap 缺位或重叠有效订单时拒绝清除库存。
-- **异常支付**：死信与数据库对账只做分类和人工补偿建议，尚未接入支付平台查询与退款接口。
+API 默认监听 127.0.0.1:8011；[Swagger UI](http://127.0.0.1:8011/docs)，OpenAPI 位于 /v3/api-docs。消费者和调度器不启动 HTTP 端口。同一环境运行一个调度器，API 默认不启动后台任务。
 
-## 重要局限
+## 接口
 
-- 当前所有支付都是模拟平台的 HMAC 通知，非真实资金结算。
-- 生产环境还需支付流水表、退款、Outbox、服务鉴权、运维告警及全面压力测试。
-- 在未执行真正集成测试前，不能把纯内存竞态模拟当成真实 RabbitMQ 并发正确性的证据。
-- Dockerfile 仅用于构建 API 镜像，数据库/Redis/MQ 为独立基础设施，部署时需调整容器网络地址与 `DATABASE_URL`。
+| 接口 | 功能 |
+|---|---|
+| GET /api/v1/trains/search?from_station=BJS&to_station=SHH&date=2026-10-31 | 日期、途经站查询 |
+| GET /api/v1/seats/available?train_id=1&start_station=0&end_station=2 | 区间空闲座位 |
+| POST /api/v1/orders | 幂等下单与事务占座 |
+| GET /api/v1/orders/{order_no}?user_id=1 | 用户订单查询 |
+| POST /api/v1/payment/callback | 原始请求体验签、时间戳校验、可靠入队 |
+| POST /api/v1/payment/{order_no} | 旧模拟直付，默认关闭 |
+| GET /health、GET / | 存活检查、服务信息 |
 
-## 维护与安全
+JSON 保留 snake_case 字段，金额是十进制字符串，订单时间为 UTC。区间是 [start_station,end_station)，最多 31 位。区间值是沿途站点零基位置，不是车站主键；车次查询会返回这些位置。
 
-`.env` 不进入 Git；仅提交 `.env.example`。**如果已把真实开发密钥提交到任何公开仓库，应立即轮换。** 不要通过修改 `CLOSED → PAID` 来处理迟到支付，也不要清空历史订单及队列。
+下单请求（先查询实际车次和座位 ID）：
+
+```json
+{"user_id":1,"request_id":"booking_001","train_id":1,"seat_id":1,"start_station":0,"end_station":2}
+```
+
+同一用户重试需使用相同 request_id 和业务参数，改变参数返回 409。客户端不能指定金额。
+
+## Java 运维命令
+
+统一入口：`java -jar target/railflow-2.0.0.jar --railflow.command=<命令>`。选项用 --key=value；布尔开关可只写 --demo。
+
+| 命令及附加选项 | 用途及数据影响 |
+|---|---|
+| inventory-audit | 全座位只读对账 |
+| inventory-repair --demo | 纯内存五类异常演示 |
+| inventory-repair --seat-id=4 | 指定座位只读补偿预览 |
+| payment-close-race | 纯内存支付/关单顺序演练 |
+| dead-letter-audit --order-no=<订单号> --payment-no=<流水号> --event-timestamp=<UNIX秒> | 只读订单分类，不消费 MQ 消息 |
+| simulate-payment-callback --order-no=<订单号> --payment-no=pay_test_001 | 签名模拟通知，会发布 MQ 消息 |
+| booking-load-test --train-id=1 --seat-id=3 --start=0 --end=2 --count=20 --workers=10 --mode=different | 并发创建真实测试订单，使用空闲测试区间 |
+
+inventory-repair --apply 只补回明确缺失位，拒绝重叠、非法订单和多余占位。需停掉所有写入进程、备份数据，指定 --maintenance-mode --confirm-seat-id=<同一座位> 并按终端提示确认。不会清空 Bitmap，也不会自动退款。
+
+## 一致性设计
+
+- 占座和订单同一事务提交；MySQL 座位行锁及 (user_id,request_id) 唯一约束提供最终保障。Redis token 锁和缓存属于优化，可故障降级。
+- READ COMMITTED 避免等待行锁后读取旧快照。每笔过期订单独立事务，关单前检查完整占位及有效订单重叠。
+- 支付和关单锁同一订单行；关闭订单不再支付；重复成功通知返回 ALREADY_PAID。
+- RabbitMQ 消息持久化，发布确认后才返回 202；失败事件先确认死信发布再 ACK，死信发布失败则 NACK 重入队。
+- 库存基准是全部 PENDING_PAYMENT、PAID 订单掩码按位或，包括尚未关闭的过期订单。
+
+## Docker、目录和验证边界
+
+```powershell
+docker build -t railflow-java .
+```
+
+镜像默认启动 API，消费者可传 --railflow.command=payment-consumer。容器的数据库/Redis/MQ 地址需指向相应服务；镜像设置 BIND_ADDRESS=0.0.0.0。
+
+src/main/java/com/railflow/ 下有 common、db、domain、train、order、payment、maintenance、web 包；src/main/resources 保存配置和建表 SQL；src/test 是 Java 测试；sql/ 保留人工对账 SQL。
+
+自动测试用 H2 MySQL 兼容模式和消息客户端 mock，不依赖外部基础设施。迁移说明见 [MIGRATION.md](MIGRATION.md)。H2、mock 和内存演练不证明真实 MySQL/Redis/RabbitMQ 的端到端并发正确性。
+
+项目用于工程学习，尚需真实支付流水去重、查单/退款、Outbox、鉴权、告警和真实压力测试。/health 仅为存活检查。
