@@ -1,24 +1,22 @@
-name: Python tests
-
+name: Java tests
 on:
   push:
   pull_request:
-
 permissions:
   contents: read
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-java@v4
         with:
-          python-version: '3.12'
-          cache: 'pip'
-      - run: python -m pip install -r requirements.txt
-      - name: Run SQLite/in-memory unit tests
-        env:
-          DATABASE_URL: 'sqlite+pysqlite:///:memory:'
-          RAILFLOW_PAYMENT_CALLBACK_SECRET: test_only_secret
-        run: python -m pytest -q
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Compile, test and package
+        run: mvn -B -ntp verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: railflow-java
+          path: target/railflow-2.0.0.jar
