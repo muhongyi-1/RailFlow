@@ -7,6 +7,7 @@ import com.railflow.domain.OrderStatus;
 import com.railflow.payment.PaymentNotApplicable;
 import com.railflow.payment.PaymentService;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.RedisConnectionFailureException;
@@ -16,6 +17,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -248,7 +250,7 @@ class OrderServiceTest {
         assertThat(orders.query(11, created.orderNo()).status()).isEqualTo(OrderStatus.CLOSED);
     }
 
-    @Test
+    @RepeatedTest(20)
     void realDatabasePaymentCloseRaceNeverPaysAnExpiredOrder() throws Exception {
         var order = orders.create(request(11, "pay-close", 1, 0, 2));
         expire(order);
@@ -263,9 +265,53 @@ class OrderServiceTest {
             }
             return "CLOSED_" + expiration.closeExpiredOrders();
         });
-        assertThat(results).containsExactlyInAnyOrder("REJECTED", "CLOSED_1");
+        assertThat(results).contains("REJECTED");
+        String closeResult = results.get(1);
+        assertThat(closeResult).isIn("CLOSED_0", "CLOSED_1");
+        int firstScanClosed = closeResult.equals("CLOSED_1") ? 1 : 0;
+        // SKIP LOCKED may defer the order while payment holds its lock. Both workers
+        // have completed now, so one more scan must close it exactly once overall.
+        assertThat(orders.query(11, order.orderNo()).status()).isEqualTo(
+                firstScanClosed == 1 ? OrderStatus.CLOSED : OrderStatus.PENDING_PAYMENT);
+        assertThat(bitmap(1)).isEqualTo(firstScanClosed == 1 ? 0 : 3);
+        assertThat(firstScanClosed + expiration.closeExpiredOrders()).isEqualTo(1);
         assertThat(orders.query(11, order.orderNo()).status()).isEqualTo(OrderStatus.CLOSED);
         assertThat(bitmap(1)).isZero();
+        assertThat(expiration.closeExpiredOrders()).isZero();
+    }
+
+    @Test
+    void lockedExpiredOrderKeepsInventoryUntilNextScanAfterUnlock() throws Exception {
+        var order = orders.create(request(11, "locked-expired", 1, 0, 2));
+        expire(order);
+        var locked = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var pool = Executors.newSingleThreadExecutor();
+        try {
+            var holder = pool.submit(() -> new TransactionTemplate(manager).executeWithoutResult(tx -> {
+                jdbc.queryForObject("SELECT id FROM orders WHERE id=? FOR UPDATE", Long.class, order.id());
+                locked.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("Lock release timed out");
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(ex);
+                }
+            }));
+            assertThat(locked.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(expiration.closeExpiredOrders()).isZero();
+            assertThat(orders.query(11, order.orderNo()).status()).isEqualTo(OrderStatus.PENDING_PAYMENT);
+            assertThat(bitmap(1)).isEqualTo(3);
+            release.countDown();
+            holder.get(5, TimeUnit.SECONDS);
+            assertThat(expiration.closeExpiredOrders()).isEqualTo(1);
+            assertThat(orders.query(11, order.orderNo()).status()).isEqualTo(OrderStatus.CLOSED);
+            assertThat(bitmap(1)).isZero();
+            assertThat(expiration.closeExpiredOrders()).isZero();
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
     }
 
     private <T> List<T> concurrently(int count, java.util.function.IntFunction<Callable<T>> job) throws Exception {
